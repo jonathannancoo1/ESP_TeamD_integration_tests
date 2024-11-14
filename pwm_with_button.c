@@ -18,7 +18,12 @@
 #include "driver/gpio.h"
 #include "driver/pwm.h"
 
+
+
 static const char *TAG = "PWM_Test";
+
+
+
 
 gpio_config_t button_config = {
     .pin_bit_mask = (1ULL << GPIO_NUM_0),
@@ -28,23 +33,44 @@ gpio_config_t button_config = {
     .intr_type = GPIO_INTR_DISABLE
 };
 
-static void pwm_task(void *pvParameters) {
+
+void pwm_task(void *pvParameters) {
     while(1) {
-        if (gpio_get_level(GPIO_NUM_0) != 1) {
+         if (gpio_get_level(GPIO_NUM_0) == 1) {
             pwm_start();
             ESP_LOGI(TAG, "PWM ON");
-            vTaskDelay(pdMS_TO_TICKS(5000)); // Keep PWM on for 5 seconds
+            vTaskDelay(pdMS_TO_TICKS(10000)); // Keep PWM on for 5 seconds
 
+            }
+
+         else{
             pwm_stop(0); // 0 means graceful stop; 1 would be immediate
+
             ESP_LOGI(TAG, "PWM OFF");
-            vTaskDelay(pdMS_TO_TICKS(5000)); // Keep PWM off for 5 seconds
-        }
+            vTaskDelay(pdMS_TO_TICKS(10000)); // Keep PWM off for 5 seconds
+         
+         }
+         }
+    vTaskDelete(NULL);
+
+      }
+    
+
+
+void non_pwm_task(void *pvParameters) {
+    while(1) {
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            printf("other task \n");
+    
     }
+
+
+    vTaskDelete(NULL);
 }
 
 void app_main() {
     ESP_LOGI(TAG, "Start PWM Test\n");
-
+    printf("start \n");
     // Initialize GPIO for button
     gpio_config(&button_config);
     vTaskDelay(1000 / portTICK_RATE_MS);
@@ -58,6 +84,8 @@ void app_main() {
     pwm_set_phases(phases);
 
     ESP_LOGI(TAG, "Start RTOS Task\n");
+    
+    xTaskCreate(pwm_task, "pwm_task", 2048, NULL, 4, NULL);
+    xTaskCreate(non_pwm_task, "non pwm_task", 2048, NULL, 5, NULL);
 
-    xTaskCreate(pwm_task, "pwm_task", 2048, NULL, 5, NULL);
 }
