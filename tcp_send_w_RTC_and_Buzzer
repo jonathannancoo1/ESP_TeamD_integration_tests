@@ -1,14 +1,3 @@
-#include <string.h>
-#include <sys/param.h>
-
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "esp_system.h"
-#include "esp_log.h"
-#include "esp_netif.h"
-#include "esp_event.h"
-#include "nvs.h"
-#include "nvs_flash.h"
 
 #include "lwip/err.h"
 #include "lwip/sockets.h"
@@ -33,31 +22,57 @@
 #include "driver/i2c.h"
 #include "i2cdev.h"
 #include "ds3231.h"
+#include "esp_sleep.h"
+#include "driver/gpio.h"
+#include "driver/uart.h"
+#include "driver/i2c.h"
+#include "ads111x.h"
 
 
-#define EXAMPLE_ESP_WIFI_SSID      "ICES"
+//settings
+#define EXAMPLE_ESP_WIFI_SSID      "ESPTEAMD"
 #define EXAMPLE_ESP_WIFI_PASS      "12345678"
 #define EXAMPLE_ESP_MAXIMUM_RETRY  5
-#define HOST_IP_ADDR               "192.168.97.76"
+#define HOST_IP_ADDR               "192.168.6.7"
 #define CONFIG_EXAMPLE_IPV4
 #define PORT                        8080
-#define MAX_MESSAGES                3         
+#define USER_INPUTS                 5         
 #define MAX_MSG_LENGTH              128      
 
 
-static char stored_messages[MAX_MESSAGES][MAX_MSG_LENGTH];
+
+
+
+
+#define SAMPLE_RATE_HZ 64   // Data rate for the ADS111X, in samples per second
+#define SAMPLE_DURATION_SEC 5 // Duration in seconds (1 second)
+#define SAMPLE_COUNT (SAMPLE_RATE_HZ * SAMPLE_DURATION_SEC)-3 // Total samples to collect (128 for 1 second)
+int8_t binary_buffer[SAMPLE_COUNT];
+
+// Buffer to store ADC values
+int16_t adc_buffer[SAMPLE_COUNT];
+
+static char stored_messages[USER_INPUTS][MAX_MSG_LENGTH];
 static int message_index = 0;
 
+//Struct To pass as PVParams
 typedef struct {
-       i2c_config_t pinconfig1;
-    i2c_dev_t dev1;
-    int store_value1;
-    int do_i_flash;
-}task_1_params_t;
+    i2c_config_t pinconfig1;//Passing Pin config
+    i2c_dev_t dev_RTC;//rtc
+    i2c_dev_t dev_ADC;//adc
+    int RTC_interval;//interval
+    int message_frmat_choice;//file type
+    int No_of_NVS_msg;//No of readings
+    int NVS_interval;//How often to log
 
+}tasks_params_t;
 
+//System time struct to store
 
 struct tm time_read;
+
+
+
 
 /* FreeRTOS event group to signal when we are connected*/
 static EventGroupHandle_t s_wifi_event_group;
@@ -68,7 +83,7 @@ static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
-static const char *TAG = "wifi station";
+static const char *TAG = "Final TestV3";
 
 static int s_retry_num = 0;
 
@@ -94,7 +109,7 @@ static void event_handler(void* arg, esp_event_base_t event_base,
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
-struct tm time_read;
+
 
 
 void wifi_init_sta(void)
@@ -158,7 +173,8 @@ void wifi_init_sta(void)
 }
 
 
-static void tcp_client_task(){ 
+
+static void Take_User_inputs(){ 
     char rx_buffer[MAX_MSG_LENGTH];
     char addr_str[128];
     int addr_family;
@@ -211,11 +227,11 @@ static void tcp_client_task(){
 
             // Store the received message
             snprintf(stored_messages[message_index], MAX_MSG_LENGTH, "%s", rx_buffer);
-            message_index = (message_index + 1) % MAX_MESSAGES; // Cycle index to avoid overflow
+            message_index = (message_index + 1) % USER_INPUTS; // Cycle index to avoid overflow
 
             // Print stored messages
             ESP_LOGI(TAG, "Stored messages:");
-            for (int i = 0; i < MAX_MESSAGES; i++) {
+            for (int i = 0; i < USER_INPUTS; i++) {
                 if (stored_messages[i][0] != '\0') { // Print only non-empty messages
                     ESP_LOGI(TAG, "Message %d: %s", i, stored_messages[i]);
                 }
@@ -223,7 +239,7 @@ static void tcp_client_task(){
 
             // Check if the maximum number of messages has been reached
             if (message_index == 0) {
-                ESP_LOGI(TAG, "Received 10 messages. Closing socket...");
+                ESP_LOGI(TAG, "Received User messages. Closing socket...");
                 ESP_LOGI(TAG, "Shutting down socket...");
                 shutdown(sock, 0);
                 close(sock);
@@ -236,232 +252,151 @@ static void tcp_client_task(){
 
         }
 
-        vTaskDelay(2000 / portTICK_PERIOD_MS); // Delay to avoid tight loop if no data is received
-    }
-
-
-                ESP_LOGI(TAG, "Here.2");
-
-
-
-}
-
-static void perodic_check(void *pvParameters) {
-    char rx_buffer[MAX_MSG_LENGTH];
-    char addr_str[128];
-    int addr_family;
-    int ip_protocol;
-    char send_buffer[MAX_MSG_LENGTH];
-
-
-    // Determine IP address and protocol based on IPv4 or IPv6 configuration
-#ifdef CONFIG_EXAMPLE_IPV4
-    struct sockaddr_in destAddr;
-    destAddr.sin_addr.s_addr = inet_addr(HOST_IP_ADDR);
-    destAddr.sin_family = AF_INET;
-    destAddr.sin_port = htons(PORT);
-    addr_family = AF_INET;
-    ip_protocol = IPPROTO_IP;
-    inet_ntoa_r(destAddr.sin_addr, addr_str, sizeof(addr_str) - 1);
-#else // IPV6
-    struct sockaddr_in6 destAddr;
-    inet6_aton(HOST_IP_ADDR, &destAddr.sin6_addr);
-    destAddr.sin6_family = AF_INET6;
-    destAddr.sin6_port = htons(PORT);
-    destAddr.sin6_scope_id = tcpip_adapter_get_netif_index(TCPIP_ADAPTER_IF_STA);
-    addr_family = AF_INET6;
-    ip_protocol = IPPROTO_IPV6;
-    inet6_ntoa_r(destAddr.sin6_addr, addr_str, sizeof(addr_str) - 1);
-#endif
-
-    while (1) {
-        // Create a socket each time we check for messages
-        int sock = socket(addr_family, SOCK_STREAM, ip_protocol);
-        if (sock < 0) {
-            ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
-            vTaskDelay(10000 / portTICK_PERIOD_MS); // Delay before retrying
-            continue; // Try again after delay
-        }
-        ESP_LOGI(TAG, "Socket created");
-
-        // Try to connect to the server
-        int err = connect(sock, (struct sockaddr *)&destAddr, sizeof(destAddr));
-        if (err != 0) {
-            ESP_LOGE(TAG, "Socket unable to connect: errno %d", errno);
-            close(sock);
-            vTaskDelay(10000 / portTICK_PERIOD_MS); // Delay before retrying
-            continue; // Try again after delay
-        }
-        ESP_LOGI(TAG, "Successfully connected to %s", addr_str);
-
-        // Try to receive a message from the server
-        int len = recv(sock, rx_buffer, sizeof(rx_buffer) - 1, 0);
-        
-        if (len < 0) {
-            ESP_LOGE(TAG, "recv failed: errno %d", errno);
-        } else if (len > 0) {
-            rx_buffer[len] = 0; // Null-terminate the received data
-            ESP_LOGI(TAG, "Received %d bytes from %s:", len, addr_str);
-            ESP_LOGI(TAG, "%s", rx_buffer);  // Print the received message
-        } else {
-            ESP_LOGI(TAG, "No data received from server");
-        }
-            ESP_LOGI(TAG, "time to send");
-
-        snprintf(send_buffer, sizeof(send_buffer), 
-                 "Hello\nYear: %d\nMonth: %d\nDay: %d\nHour: %d\nMinute: %d\nSecond: %d\n",
-                 time_read.tm_year + 1900,  // Year
-                 time_read.tm_mon + 1,      // Month (tm_mon is 0-11, so add 1)
-                 time_read.tm_mday,         // Day
-                 time_read.tm_hour,         // Hour
-                 time_read.tm_min,          // Minute
-                 time_read.tm_sec);         // Second
-
-
-        
-        // Send the message to the server
-        len = send(sock, send_buffer, strlen(send_buffer), 0);
-        if (len < 0) {
-            ESP_LOGE(TAG, "Send failed: errno %d", errno);
-        } else {
-            ESP_LOGI(TAG, "Sent %d bytes to %s", len, addr_str);
-        }
-
-
-        // Close the socket after receiving or if no data
-        shutdown(sock, 0);
-        close(sock);
-        ESP_LOGI(TAG, "Socket closed");
-
-        // Delay 10 seconds before checking again
-        vTaskDelay(10000 / portTICK_PERIOD_MS);
     }
 }
 
 
-void Read_frm_clock(void *pvParameters) {
 
-    task_1_params_t *params = (task_1_params_t *)pvParameters;
-    i2c_dev_t dev=params->dev1;
-    int interval=params->store_value1;
+void AdcTask(void *pvParameters) {
+    int sample_idx = 0;
+    int16_t adc_value = 0;
+    unsigned long elapsed_time = 0;
+    unsigned long start_time=0;
+tasks_params_t *params = (tasks_params_t *)pvParameters;
 
-esp_err_t checker;
+    // Access struct fields
+    i2c_dev_t adc_device = params->dev_ADC;
+    int interval = params->RTC_interval;
+    int message_format = params->message_frmat_choice;
+    i2c_config_t pinconfigx=params->pinconfig1;//Passing Pin config
+     
 
 
-    while (1) {
-
-                // Perform the I2C read operation
-        checker = ds3231_get_time(&dev, &time_read);
-        
-        if (checker == ESP_OK) {
-           
-          
-
-            // Print the time
-            printf("Year: %d\n", time_read.tm_year + 1900);
-            printf("Month: %d\n", time_read.tm_mon + 1);
-            printf("Day: %d\n", time_read.tm_mday);
-            printf("Hour: %d\n", time_read.tm_hour);
-            printf("Minute: %d\n", time_read.tm_min);
-            printf("Second: %d\n", time_read.tm_sec);
-        } else {
-            printf("Failed to read time from DS3231\n");
-        }
-
-        // Delay for the specified interval (in ms converted to ticks)
-        vTaskDelay(interval*1000 / portTICK_PERIOD_MS);
-    }
-}
-
-void Check_and_Buzz(void *pvParameters){
-    task_1_params_t *params = (task_1_params_t *)pvParameters;
-
-    int checker=params->do_i_flash;
-    i2c_dev_t dev=params->dev1;
-    int interval=params->store_value1;
-while(1){
-    if(checker==1){
-
-ds3231_set_squarewave_freq(&dev,DS3231_SQWAVE_1HZ);
-        ESP_LOGI(TAG, "Buzz");
-
-ds3231_enable_squarewave(&dev);
-
-        vTaskDelay((interval*1000) / portTICK_PERIOD_MS);
-
+while(1){    // Dynamically allocate buffer for storing ADC values
+    int16_t *adc_buffer = (int16_t *)malloc(SAMPLE_COUNT * sizeof(int16_t));
+    if (adc_buffer == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate memory for ADC buffer");
+        vTaskDelete(NULL); // Terminate the task if memory allocation fails
+        return;
     }
 
-    else{
+    start_time = xTaskGetTickCount();
 
-ds3231_disable_squarewave(&dev);
-        ESP_LOGI(TAG, "No Buzz");
+    while (elapsed_time < pdMS_TO_TICKS(SAMPLE_DURATION_SEC * 1000)) { // Run for specified duration
+        // Get ADC value
+         ads111x_get_value(&adc_device, &adc_value); 
+            // Store ADC value in buffer
+            adc_buffer[sample_idx] = adc_value;
 
+            // Increment sample index
+            sample_idx++;
 
-        vTaskDelay(interval*1000 / portTICK_PERIOD_MS);
-    }
-            vTaskDelay(30*1000 / portTICK_PERIOD_MS);
-
-}
-}
-
-
-void app_main()
-{
-
-
-
-
-    ESP_ERROR_CHECK(nvs_flash_init());
-    TickType_t Start,End,Ex;
-    ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
-    Start=xTaskGetTickCount();
-
-    wifi_init_sta();
-
-    End=xTaskGetTickCount();
-
-    Ex=End-Start;
-
-    printf("Execution time: %d ticks\n", Ex);
-
-            // Convert ticks to milliseconds
-    int execution_time_ms = Ex * portTICK_PERIOD_MS;
-    printf("Execution time: %d milliseconds\n", execution_time_ms);
-
-
-   tcp_client_task();
-
-    ESP_LOGI(TAG, "Out of Func.");
-
-      int store_value = 30;
-      int i=0;
-      bool temp;
+            // Log the sample
+            ESP_LOGI(TAG, "Sample %d: %d", sample_idx, adc_value);
     
+
+        // Update elapsed time
+        elapsed_time = xTaskGetTickCount() - start_time;
+
+        // Optional delay to avoid tight loop
+        vTaskDelay(pdMS_TO_TICKS(10)); // Adjust delay as needed
+    }
+
+    // Free allocated memory
+    free(adc_buffer);
+    ESP_LOGI(TAG, "ADC Task completed");
+
+}
+    vTaskDelete(NULL); // Terminate the task
+}
+
+
+void app_main(){
+
+
+
+//Connecting to Wifi
+wifi_init_sta();
+
+// Taking 5 User Inputs 
+Take_User_inputs();
+
+//Print every 30s by default
+int Interval_At_which_to_print=30;
+int i=0;
+
+//Print Values interval Selection 
+
         if (strstr(stored_messages[i], "a") != NULL) {
-            store_value = 15;  // Assign value for Option A
+            Interval_At_which_to_print = 30;  // Assign value for Option A
         } else if (strstr(stored_messages[i], "b") != NULL) {
-            store_value = 30;  // Assign value for Option B
+            Interval_At_which_to_print = 60;  // Assign value for Option B
         } else if (strstr(stored_messages[i], "c") != NULL) {
-            store_value = 45;  // Assign value for Option C
+            Interval_At_which_to_print = 90;  // Assign value for Option C
+        }else if (strstr(stored_messages[i], "d") != NULL) {
+            Interval_At_which_to_print = 120;  // Assign value for Option C
         }
 
-        ESP_LOGI(TAG, "the Delay is %d seconds",store_value);
+i++;
 
-        i++;
-        printf("%s \n",stored_messages[i]);
-        if (strstr(stored_messages[i], "yes") != NULL) {
-            temp = 1;  // Assign value for Option A
-        } else if (strstr(stored_messages[i], "no") != NULL) {
-            temp = 0;  // Assign value for Option B
+// Allowing_the user to specify how often to write to the Non Volotile Storage
+
+    int Interval_At_which_to_log=1;
+
+      if (strstr(stored_messages[i], "a") != NULL) {
+            Interval_At_which_to_log = 1;  // Assign value for Option A
+        } else if (strstr(stored_messages[i], "b") != NULL) {
+            Interval_At_which_to_log = 2;  // Assign value for Option B
+        } else if (strstr(stored_messages[i], "c") != NULL) {
+            Interval_At_which_to_log = 3;  // Assign value for Option C
+        }else if (strstr(stored_messages[i], "d") != NULL) {
+            Interval_At_which_to_log = 4;  // Assign value for Option C
         }
-        else{
-            temp=0;
-        }
-
-
-        printf("Can the serial Please fucking work \n");
 
         
+// Allowing the user to specify the file format
+
+i++;
+
+    int File_Format=0;
+    
+    if (strstr(stored_messages[i], "a") != NULL) {
+            File_Format = 0;  // Assign value for Option A
+        } else if (strstr(stored_messages[i], "b") != NULL) {
+            File_Format = 1;  // Assign value for Option B
+        }
+
+i++;
+
+// Allowing The User To indicate No of Readings to be stored
+
+int Reading_Numbers=5;
+ 
+    if (strstr(stored_messages[i], "a") != NULL) {
+            Reading_Numbers = 5;  // Assign value for Option A
+        } else if (strstr(stored_messages[i], "b") != NULL) {
+            Reading_Numbers = 10;  // Assign value for Option C
+        }
+          if (strstr(stored_messages[i], "c") != NULL) {
+            Reading_Numbers = 15;  // Assign value for Option A
+        } else if (strstr(stored_messages[i], "d") != NULL) {
+            Reading_Numbers = 20;  // Assign value for Option D
+        }
+
+
+
+
+    // Log the selections
+    printf("User Selections Based\n");
+    printf("------------------------------------\n");
+    printf("Interval at which to Display: %d seconds\n", Interval_At_which_to_print);
+    printf("Interval at which to log: %d seconds\n", Interval_At_which_to_log*Interval_At_which_to_print);
+    printf("File Format: %s\n", (File_Format == 0) ? "Format A" : "Format B");
+    printf("Number of Readings to be stored: %d\n", Reading_Numbers);
+    printf("------------------------------------\n");
+
+
+     
     i2cdev_init();
     i2c_config_t pinconfig;
 
@@ -483,54 +418,46 @@ void app_main()
     pinconfig.clk_stretch_tick = 1000;
 
 
-    i2c_dev_t dev;
-    memset(&dev, 0, sizeof(i2c_dev_t));
-    dev.addr=DS3231_ADDR;
-    dev.cfg=pinconfig;
-    dev.port=I2C_NUM_0;
+i2c_dev_t dev1;
+    memset(&dev1, 0, sizeof(i2c_dev_t));
+    dev1.addr=DS3231_ADDR;
+    dev1.cfg=pinconfig;
+    dev1.port=I2C_NUM_0;
 
-esp_err_t installer = ds3231_init_desc(&dev,0,GPIO_NUM_2,GPIO_NUM_0);
+i2c_dev_t dev2;
+    memset(&dev2, 0, sizeof(i2c_dev_t));
+    dev2.addr=ADS111X_ADDR_GND;
+    dev2.cfg=pinconfig;
+    dev2.port=I2C_NUM_0;
+
+//Setting up the ADC
+
+ads111x_init_desc(&dev2,ADS111X_ADDR_GND,I2C_NUM_0,GPIO_NUM_2,GPIO_NUM_0);
+ads111x_set_gain(&dev2,ADS111X_GAIN_4V096);
+ads111x_set_input_mux(&dev2,ADS111X_MUX_0_GND);
+ads111x_set_mode(&dev2,ADS111X_MODE_CONTINUOUS);
+ads111x_set_data_rate(&dev2,ADS111X_DATA_RATE_128);
+
+
+
+
+
+
+esp_err_t installer = ds3231_init_desc(&dev2,0,GPIO_NUM_2,GPIO_NUM_0);
     if (installer==ESP_OK){
 
         printf("Set up Properly \n");
     }
-esp_err_t read;
-    read = ds3231_get_time(&dev, &time_read);
-        
-        if (read == ESP_OK) {
-           
-          
 
-            // Print the time
-            printf("Year: %d\n", time_read.tm_year + 1900);
-            printf("Month: %d\n", time_read.tm_mon + 1);
-            printf("Day: %d\n", time_read.tm_mday);
-            printf("Hour: %d\n", time_read.tm_hour);
-            printf("Minute: %d\n", time_read.tm_min);
-            printf("Second: %d\n", time_read.tm_sec);
-        } else {
-            printf("Failed to read time from DS3231\n");
-        }
+tasks_params_t Values;
+Values.dev_RTC=dev1;
+Values.dev_ADC=dev2;
+Values.RTC_interval=Interval_At_which_to_print;
+Values.NVS_interval=Interval_At_which_to_log*Interval_At_which_to_print;
+Values.message_frmat_choice=File_Format;
+Values.pinconfig1=pinconfig;
 
 
-    task_1_params_t params;
-    memset(&params, 0, sizeof(task_1_params_t));
-
-    params.dev1=dev;
-    params.pinconfig1=pinconfig;
-    params.store_value1=store_value;
-    if(temp){
-        
-        params.do_i_flash=1;
-        
-        }
-
-        else{
-
-            params.do_i_flash=0;
-        }
-
-    xTaskCreate(Read_frm_clock, "Read frm clock", 2048, &params, 5, NULL);
-    xTaskCreate(Check_and_Buzz,"Check and buzz",2048, &params, 6, NULL);
-    xTaskCreate(perodic_check,"Periodic Check",2048, &params, 4, NULL);
+    xTaskCreate(AdcTask, "AdcTask", 4096, &Values, 5, NULL);
 }
+
